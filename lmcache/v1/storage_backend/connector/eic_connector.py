@@ -702,6 +702,12 @@ class EICConnector(RemoteConnector):
         # only confirmed when both landed; collect the rest and raise once so
         # the task future carries the failure instead of completing normally.
         failed = list(skipped_key_strs)
+        # A meta that landed while its data failed is an orphan: the read path
+        # would find the meta, treat the chunk as a hit, and hand back the
+        # missing/stale data key as if it were valid. Collect those metas and
+        # delete them before surfacing the failure, so the chunk reads as a
+        # clean miss and is recomputed.
+        orphaned_meta_key_strs: List[str] = []
         for pos, key_str in enumerate(batched_key_strs):
             meta_err = set_outcome.status_codes[2 * pos]
             data_err = set_outcome.status_codes[2 * pos + 1]
@@ -718,11 +724,45 @@ class EICConnector(RemoteConnector):
                 data_err,
             )
             failed.append(key_str)
+            if meta_err == eic.StatusCode.SUCCESS:
+                orphaned_meta_key_strs.append(key_str + "_meta")
+
+        # Best-effort cleanup before the failure propagates; never raises.
+        self._delete_orphaned_meta(orphaned_meta_key_strs)
 
         if failed:
             raise RuntimeError(
                 f"eic batched_put failed for {len(failed)} of "
                 f"{len(batched_key_strs) + len(skipped_key_strs)} chunks: {failed}"
+            )
+
+    def _delete_orphaned_meta(self, meta_key_strs: List[str]) -> None:
+        """Delete metas whose data write failed, turning the chunk into a miss.
+
+        Best effort: a surviving orphan only falls back to the previous
+        behavior (a later read may return the stale data key), so a delete
+        failure is logged and swallowed rather than masking the write failure.
+        """
+        if not meta_key_strs:
+            return
+        try:
+            del_keys = eic.StringVector()
+            for key_str in meta_key_strs:
+                del_keys.append(key_str)
+            del_option = eic.DelOption()
+            del_option.ns = self.eic_kv_ns
+            del_code, _ = self.connection.mdel(del_keys, del_option)
+            logger.warning(
+                "eic batched_put deleted %d orphaned meta key(s) after a data "
+                "write failure, status_code %s",
+                len(meta_key_strs),
+                del_code,
+            )
+        except Exception as e:
+            logger.error(
+                "eic batched_put failed to delete %d orphaned meta key(s): %s",
+                len(meta_key_strs),
+                e,
             )
 
     async def put(self, key: CacheEngineKey, memory_obj: MemoryObj):

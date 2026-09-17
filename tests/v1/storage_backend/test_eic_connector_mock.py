@@ -122,6 +122,8 @@ class _FakeClient:
         self.mget_override = None
         self.mget_calls = []
         self.mset_calls = []
+        self.mdel_calls = []
+        self.mdel_result = None
 
     def init(self, instance_id, endpoint, option):
         self.instance_id = instance_id
@@ -173,6 +175,15 @@ class _FakeClient:
             status_codes=[_StatusCode.KEY_NOT_EXIST]
         )
 
+    def mdel(self, keys, option=None):
+        keys = list(keys)
+        self.mdel_calls.append((keys, option))
+        if isinstance(self.mdel_result, BaseException):
+            raise self.mdel_result
+        if self.mdel_result is not None:
+            return self.mdel_result
+        return _StatusCode.SUCCESS, SimpleNamespace(status_codes=[0] * len(keys))
+
     def register_memory(self, vals, meminfo):
         return True
 
@@ -199,6 +210,7 @@ def build_fake_eic():
     fake.SetOption = type("SetOption", (), {})
     fake.GetOption = type("GetOption", (), {})
     fake.ExistOption = type("ExistOption", (), {})
+    fake.DelOption = type("DelOption", (), {})
     fake.StringVector = _StringVector
     fake.IOBuffers = _IOBuffers
     fake.MemoryInfo = type("MemoryInfo", (), {})
@@ -688,6 +700,75 @@ def test_batched_put_all_skipped_raises_without_mset(env):
         asyncio.run(connector._batched_put(keys, objs))
     # No addressable chunk means no mset is attempted.
     assert client.mset_calls == []
+
+
+def test_batched_put_orphaned_meta_is_deleted_when_data_fails(env):
+    # meta landed + data failed leaves an orphan meta the read path would turn
+    # into a bogus hit. The connector must delete that meta before raising.
+    client = env.client
+    connector = env.conn
+    # Use a non-default namespace so a missing/!mismatched ns cannot be hidden
+    # by an empty-string default; write and delete must target the same one.
+    connector.eic_kv_ns = "test-ns"
+    keys = [FakeKey("b0"), FakeKey("b1")]
+    objs = [
+        make_memory_obj([SHAPE], [torch.bfloat16]),
+        make_memory_obj([SHAPE], [torch.bfloat16]),
+    ]
+    client.mset_result = (
+        _StatusCode.PARTIAL_FAILED,
+        [
+            _StatusCode.SUCCESS,  # b0 meta
+            _StatusCode.SUCCESS,  # b0 data
+            _StatusCode.SUCCESS,  # b1 meta
+            _StatusCode.FAILED,  # b1 data
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="1 of 2"):
+        asyncio.run(connector._batched_put(keys, objs))
+
+    assert len(client.mdel_calls) == 1
+    deleted, del_option = client.mdel_calls[0]
+    assert deleted == ["b1_meta"]
+    _, _, mset_option = client.mset_calls[0]
+    # The orphan cleanup deletes in the SAME non-default namespace the write
+    # used; otherwise mdel would land in the binding default ns and no-op.
+    assert del_option.ns == mset_option.ns == "test-ns"
+
+    # A meta-only failure is not an orphan: nothing to delete.
+    client.mdel_calls.clear()
+    client.mset_result = (
+        _StatusCode.PARTIAL_FAILED,
+        [
+            _StatusCode.SUCCESS,  # b0 meta
+            _StatusCode.SUCCESS,  # b0 data
+            _StatusCode.FAILED,  # b1 meta
+            _StatusCode.SUCCESS,  # b1 data (unreachable dead weight)
+        ],
+    )
+    with pytest.raises(RuntimeError, match="1 of 2"):
+        asyncio.run(connector._batched_put(keys, objs))
+    assert client.mdel_calls == []
+
+
+def test_batched_put_orphan_delete_failure_does_not_mask_write_error(env):
+    # A failed cleanup must swallow and still raise the original write failure.
+    client = env.client
+    connector = env.conn
+    keys = [FakeKey("b0")]
+    objs = [make_memory_obj([SHAPE], [torch.bfloat16])]
+    client.mset_result = (
+        _StatusCode.PARTIAL_FAILED,
+        [_StatusCode.SUCCESS, _StatusCode.FAILED],
+    )
+    client.mdel_result = RuntimeError("mdel transport down")
+
+    # The connector logs/swallows the mdel error internally; it must not
+    # propagate that instead of (or in addition to) the batched-put failure.
+    with pytest.raises(RuntimeError, match="1 of 1"):
+        asyncio.run(connector._batched_put(keys, objs))
+    assert len(client.mdel_calls) == 1
 
 
 def test_batched_put_whole_call_failed_raises(env):
